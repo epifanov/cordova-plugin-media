@@ -18,6 +18,7 @@
 #import "CDVSound.h"
 #import "CDVFile.h"
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #include <math.h>
 
 #define DOCUMENTS_SCHEME_PREFIX @"documents://"
@@ -25,6 +26,164 @@
 #define HTTPS_SCHEME_PREFIX @"https://"
 #define CDVFILE_PREFIX @"cdvfile://"
 #define FILE_PREFIX @"file://"
+
+// Ogg page checksum: CRC-32 with polynomial 0x04c11db7, no reflection, zero initial value
+static uint32_t CDVOggCrc(const uint8_t* bytes, NSUInteger length)
+{
+    static uint32_t table[256];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t r = i << 24;
+            for (int bit = 0; bit < 8; bit++) {
+                r = (r & 0x80000000) ? (r << 1) ^ 0x04c11db7 : (r << 1);
+            }
+            table[i] = r;
+        }
+    });
+    uint32_t crc = 0;
+    for (NSUInteger i = 0; i < length; i++) {
+        crc = (crc << 8) ^ table[(crc >> 24) ^ bytes[i]];
+    }
+    return crc;
+}
+
+static void CDVAppendOggPage(NSMutableData* ogg, NSArray<NSData*>* packets, uint8_t headerType, uint64_t granule, uint32_t serial, uint32_t sequence)
+{
+    NSMutableData* page = [NSMutableData dataWithBytes:"OggS" length:4];
+    uint8_t version = 0;
+    uint64_t granuleLE = CFSwapInt64HostToLittle(granule);
+    uint32_t serialLE = CFSwapInt32HostToLittle(serial);
+    uint32_t sequenceLE = CFSwapInt32HostToLittle(sequence);
+    uint32_t crc = 0;
+    [page appendBytes:&version length:1];
+    [page appendBytes:&headerType length:1];
+    [page appendBytes:&granuleLE length:8];
+    [page appendBytes:&serialLE length:4];
+    [page appendBytes:&sequenceLE length:4];
+    [page appendBytes:&crc length:4];
+
+    // a packet is laced as 255-byte segments followed by one shorter segment
+    NSMutableData* lacing = [NSMutableData data];
+    for (NSData* packet in packets) {
+        uint8_t segment = 255;
+        for (NSUInteger i = 0; i < packet.length / 255; i++) {
+            [lacing appendBytes:&segment length:1];
+        }
+        segment = packet.length % 255;
+        [lacing appendBytes:&segment length:1];
+    }
+    uint8_t segmentCount = lacing.length;
+    [page appendBytes:&segmentCount length:1];
+    [page appendData:lacing];
+    for (NSData* packet in packets) {
+        [page appendData:packet];
+    }
+
+    crc = CFSwapInt32HostToLittle(CDVOggCrc(page.bytes, page.length));
+    [page replaceBytesInRange:NSMakeRange(22, 4) withBytes:&crc];
+    [ogg appendData:page];
+}
+
+// Moves Opus packets recorded by AVAudioRecorder from CAF into an Ogg Opus file (RFC 7845) without re-encoding.
+// Returns an error message or nil on success.
+static NSString* CDVRepackCafOpusToOgg(NSURL* cafURL, NSURL* oggURL)
+{
+    AudioFileID file;
+    if (AudioFileOpenURL((__bridge CFURLRef)cafURL, kAudioFileReadPermission, kAudioFileCAFType, &file) != noErr) {
+        return @"Unable to open recorded Opus file";
+    }
+
+    AudioStreamBasicDescription format = {0};
+    UInt64 packetCount = 0;
+    UInt32 maxPacketSize = 0;
+    UInt32 size = sizeof(format);
+    OSStatus status = AudioFileGetProperty(file, kAudioFilePropertyDataFormat, &size, &format);
+    if (status == noErr) {
+        size = sizeof(packetCount);
+        status = AudioFileGetProperty(file, kAudioFilePropertyAudioDataPacketCount, &size, &packetCount);
+    }
+    if (status == noErr) {
+        size = sizeof(maxPacketSize);
+        status = AudioFileGetProperty(file, kAudioFilePropertyMaximumPacketSize, &size, &maxPacketSize);
+    }
+    if (status != noErr || format.mFormatID != kAudioFormatOpus || format.mFramesPerPacket == 0) {
+        AudioFileClose(file);
+        return @"Recorded file is not Opus in CAF";
+    }
+    // priming and remainder frames are optional, without them nothing is trimmed
+    AudioFilePacketTableInfo packetTable = {0};
+    size = sizeof(packetTable);
+    if (AudioFileGetProperty(file, kAudioFilePropertyPacketTableInfo, &size, &packetTable) != noErr) {
+        packetTable = (AudioFilePacketTableInfo){0};
+    }
+
+    // Ogg Opus counts pre-skip and granule positions in 48 kHz samples
+    double scale = 48000.0 / format.mSampleRate;
+    uint64_t samplesPerPacket = (uint64_t)(format.mFramesPerPacket * scale);
+    uint64_t lastGranule = packetTable.mNumberValidFrames > 0
+        ? (uint64_t)((packetTable.mPrimingFrames + packetTable.mNumberValidFrames) * scale)
+        : packetCount * samplesPerPacket;
+
+    NSMutableData* head = [NSMutableData dataWithBytes:"OpusHead" length:8];
+    uint8_t headVersion = 1;
+    uint8_t channels = format.mChannelsPerFrame;
+    uint16_t preSkipLE = CFSwapInt16HostToLittle((uint16_t)(packetTable.mPrimingFrames * scale));
+    uint32_t inputRateLE = CFSwapInt32HostToLittle((uint32_t)format.mSampleRate);
+    uint16_t gain = 0;
+    uint8_t mappingFamily = 0;
+    [head appendBytes:&headVersion length:1];
+    [head appendBytes:&channels length:1];
+    [head appendBytes:&preSkipLE length:2];
+    [head appendBytes:&inputRateLE length:4];
+    [head appendBytes:&gain length:2];
+    [head appendBytes:&mappingFamily length:1];
+
+    NSData* vendor = [@"cordova-plugin-media" dataUsingEncoding:NSUTF8StringEncoding];
+    NSMutableData* tags = [NSMutableData dataWithBytes:"OpusTags" length:8];
+    uint32_t vendorLengthLE = CFSwapInt32HostToLittle((uint32_t)vendor.length);
+    uint32_t commentCount = 0;
+    [tags appendBytes:&vendorLengthLE length:4];
+    [tags appendData:vendor];
+    [tags appendBytes:&commentCount length:4];
+
+    NSMutableData* ogg = [NSMutableData data];
+    uint32_t serial = arc4random();
+    uint32_t sequence = 0;
+    CDVAppendOggPage(ogg, @[head], 0x02, 0, serial, sequence++);
+    CDVAppendOggPage(ogg, @[tags], packetCount == 0 ? 0x04 : 0, 0, serial, sequence++);
+
+    NSMutableData* buffer = [NSMutableData dataWithLength:maxPacketSize];
+    NSMutableArray<NSData*>* pagePackets = [NSMutableArray array];
+    NSUInteger pageSegments = 0;
+    for (UInt64 i = 0; i < packetCount; i++) {
+        UInt32 bytes = maxPacketSize;
+        UInt32 packets = 1;
+        AudioStreamPacketDescription description;
+        if (AudioFileReadPacketData(file, false, &bytes, &description, i, &packets, buffer.mutableBytes) != noErr || packets != 1) {
+            AudioFileClose(file);
+            return @"Unable to read recorded Opus packets";
+        }
+        NSUInteger segments = bytes / 255 + 1;
+        // a page holds up to 255 segments, 50 packets of 20 ms make about a second of speech
+        if (pageSegments + segments > 255 || pagePackets.count == 50) {
+            CDVAppendOggPage(ogg, pagePackets, 0, i * samplesPerPacket, serial, sequence++);
+            [pagePackets removeAllObjects];
+            pageSegments = 0;
+        }
+        [pagePackets addObject:[NSData dataWithBytes:buffer.bytes length:bytes]];
+        pageSegments += segments;
+    }
+    AudioFileClose(file);
+    if (pagePackets.count > 0) {
+        CDVAppendOggPage(ogg, pagePackets, 0x04, lastGranule, serial, sequence++);
+    }
+
+    if (![ogg writeToURL:oggURL atomically:YES]) {
+        return @"Unable to write Ogg file";
+    }
+    return nil;
+}
 
 @implementation CDVSound
 
@@ -56,9 +215,10 @@ BOOL keepAvAudioSessionAlwaysActive = NO;
     // first check for correct extension
     NSString* ext=[resourcePath pathExtension];
     if ([ext caseInsensitiveCompare:@"wav"] != NSOrderedSame &&
-        [ext caseInsensitiveCompare:@"m4a"] != NSOrderedSame) {
+        [ext caseInsensitiveCompare:@"m4a"] != NSOrderedSame &&
+        [ext caseInsensitiveCompare:@"ogg"] != NSOrderedSame) {
         resourceURL = nil;
-        NSLog(@"Resource for recording must have wav or m4a extension");
+        NSLog(@"Resource for recording must have wav, m4a or ogg extension");
     } else if ([resourcePath hasPrefix:DOCUMENTS_SCHEME_PREFIX]) {
         // try to find Documents:// resources
         filePath = [resourcePath stringByReplacingOccurrencesOfString:DOCUMENTS_SCHEME_PREFIX withString:[NSString stringWithFormat:@"%@/", docsPath]];
@@ -708,6 +868,8 @@ BOOL keepAvAudioSessionAlwaysActive = NO;
 
             // create a new recorder for each start record
             bool isWav=[[audioFile.resourcePath pathExtension] isEqualToString:@"wav"];
+            bool isOgg=[[audioFile.resourcePath pathExtension] caseInsensitiveCompare:@"ogg"] == NSOrderedSame;
+            NSURL* recordURL = audioFile.resourceURL;
             NSMutableDictionary *audioSettings = [NSMutableDictionary dictionaryWithDictionary:
                                             @{AVSampleRateKey: @(44100),
                                              AVNumberOfChannelsKey: @(1),
@@ -717,11 +879,18 @@ BOOL keepAvAudioSessionAlwaysActive = NO;
                 audioSettings[AVLinearPCMBitDepthKey]=@(16);
                 audioSettings[AVLinearPCMIsBigEndianKey]=@(false);
                 audioSettings[AVLinearPCMIsFloatKey]=@(false);
+            } else if (isOgg) {
+                // AVAudioRecorder writes Opus only into CAF, stopRecordingAudio repacks it into Ogg
+                audioSettings[AVFormatIDKey]=@(kAudioFormatOpus);
+                audioSettings[AVSampleRateKey]=@(16000);
+                audioSettings[AVEncoderBitRateKey]=@(16000);
+                NSString* cafName = [[audioFile.resourceURL.lastPathComponent stringByDeletingPathExtension] stringByAppendingPathExtension:@"caf"];
+                recordURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:cafName]];
             } else {
                 audioSettings[AVFormatIDKey]=@(kAudioFormatMPEG4AAC);
                 audioSettings[AVEncoderAudioQualityKey]=@(AVAudioQualityMedium);
             }
-            audioFile.recorder = [[CDVAudioRecorder alloc] initWithURL:audioFile.resourceURL settings:audioSettings error:&error];
+            audioFile.recorder = [[CDVAudioRecorder alloc] initWithURL:recordURL settings:audioSettings error:&error];
 
             bool recordingSuccess = NO;
             if (error == nil) {
@@ -792,6 +961,17 @@ BOOL keepAvAudioSessionAlwaysActive = NO;
         NSLog(@"Stopped recording audio sample '%@'", audioFile.resourcePath);
         [audioFile.recorder stop];
         // no callback - that will happen in audioRecorderDidFinishRecording
+
+        // stop closes the file synchronously, so the Ogg file is ready before the next plugin call
+        NSURL* recordURL = audioFile.recorder.url;
+        if (![recordURL isEqual:audioFile.resourceURL]) {
+            NSString* errorMsg = CDVRepackCafOpusToOgg(recordURL, audioFile.resourceURL);
+            [[NSFileManager defaultManager] removeItemAtURL:recordURL error:nil];
+            if (errorMsg != nil) {
+                NSLog(@"%@", errorMsg);
+                [self onStatus:MEDIA_ERROR mediaId:mediaId param:[self createAbortError:errorMsg]];
+            }
+        }
     }
 }
 
